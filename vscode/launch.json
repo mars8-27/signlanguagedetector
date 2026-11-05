@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "1. Train ST-GCN Model",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.train",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "2. Export Model to ONNX",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.export_onnx",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "3. Run FastAPI Server",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": ["api.app:app", "--reload", "--port", "8000"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

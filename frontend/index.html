@@ -1,0 +1,219 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real-Time Sign Language ST-GCN Translator</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+    .container { width: 100%; max-width: 900px; display: flex; flex-direction: column; gap: 1.5rem; }
+    header { display: flex; justify-content: space-between; align-items: center; }
+    h1 { font-size: 1.5rem; font-weight: 700; color: #38bdf8; }
+    .status-pill { font-size: 0.85rem; padding: 0.35rem 0.75rem; border-radius: 9999px; background: #7f1d1d; color: #fecaca; transition: all 0.3s; }
+    .status-pill.online { background: #064e3b; color: #34d399; }
+    .video-card { position: relative; width: 100%; height: 500px; background: #111827; border-radius: 12px; overflow: hidden; border: 1px solid #1f2937; display: flex; justify-content: center; align-items: center; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; object-fit: cover; }
+    .error-banner { display: none; position: absolute; top: 1rem; left: 1rem; right: 1rem; padding: 0.85rem; background: #7f1d1d; border: 1px solid #ef4444; border-radius: 8px; color: #fecaca; font-size: 0.9rem; z-index: 10; }
+    .prediction-panel { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 1rem; }
+    .metric-card { background: #1e293b; padding: 1.25rem; border-radius: 10px; border: 1px solid #334155; }
+    .metric-title { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin-bottom: 0.5rem; }
+    .metric-value { font-size: 1.8rem; font-weight: 700; color: #f8fafc; }
+    .highlight { color: #38bdf8; }
+    .controls { display: flex; gap: 1rem; }
+    button { flex: 1; padding: 0.85rem; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .btn-primary { background: #0284c7; color: white; }
+    .btn-primary:hover { background: #0369a1; }
+    .btn-secondary { background: #334155; color: #cbd5e1; }
+    .btn-secondary:hover { background: #475569; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>ST-GCN Sign Language Translator</h1>
+      <span id="connStatus" class="status-pill">Connecting to WebSocket...</span>
+    </header>
+
+    <div class="video-card">
+      <div id="errorBanner" class="error-banner"></div>
+      <video id="inputVideo" playsinline autoplay muted></video>
+      <canvas id="outputCanvas" width="640" height="480"></canvas>
+    </div>
+
+    <div class="controls">
+      <button class="btn-primary" onclick="startCamera()">Start Camera Tracking</button>
+      <button class="btn-secondary" onclick="stopCamera()">Stop Camera</button>
+    </div>
+
+    <div class="prediction-panel">
+      <div class="metric-card">
+        <div class="metric-title">Predicted Sign</div>
+        <div class="metric-value highlight" id="signLabel">WAITING</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Confidence</div>
+        <div class="metric-value" id="confLabel">0.0%</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Inference Latency</div>
+        <div class="metric-value" id="latencyLabel">0 ms</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const POSE_INDICES = [0, 9, 10, 11, 12, 13, 14, 15, 16, 23, 24];
+    const video = document.getElementById("inputVideo");
+    const canvas = document.getElementById("outputCanvas");
+    const ctx = canvas.getContext("2d");
+    const errorBanner = document.getElementById("errorBanner");
+    const connPill = document.getElementById("connStatus");
+
+    let stream = null;
+    let animId = null;
+    let ws = null;
+    let isProcessing = false;
+    let isAwaitingInference = false;
+
+    function showError(msg) {
+      errorBanner.style.display = "block";
+      errorBanner.innerText = msg;
+    }
+
+    function hideError() {
+      errorBanner.style.display = "none";
+    }
+
+    function initWebSocket() {
+      const host = window.location.host || "127.0.0.1:8000";
+      ws = new WebSocket("ws://" + host + "/ws/translate");
+
+      ws.onopen = () => {
+        connPill.innerText = "WebSocket: Online";
+        connPill.className = "status-pill online";
+      };
+
+      ws.onmessage = (event) => {
+        isAwaitingInference = false;
+        const data = JSON.parse(event.data);
+        if (data.predicted_sign) {
+          document.getElementById("signLabel").innerText = data.predicted_sign;
+          document.getElementById("confLabel").innerText = (data.confidence * 100).toFixed(1) + "%";
+          document.getElementById("latencyLabel").innerText = data.latency_ms + " ms";
+        }
+      };
+
+      ws.onclose = () => {
+        connPill.innerText = "WebSocket: Disconnected (Retrying...)";
+        connPill.className = "status-pill";
+        isAwaitingInference = false;
+        setTimeout(initWebSocket, 2000);
+      };
+    }
+
+    window.addEventListener("beforeunload", () => {
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+    });
+
+    function extract53Landmarks(results) {
+      const landmarks = Array.from({ length: 53 }, () => [0.0, 0.0, 0.0]);
+      if (results.poseLandmarks) {
+        POSE_INDICES.forEach((idx, i) => {
+          const pt = results.poseLandmarks[idx];
+          if (pt) landmarks[i] = [pt.x, pt.y, pt.z];
+        });
+      }
+      if (results.leftHandLandmarks) {
+        results.leftHandLandmarks.forEach((pt, i) => {
+          landmarks[11 + i] = [pt.x, pt.y, pt.z];
+        });
+      }
+      if (results.rightHandLandmarks) {
+        results.rightHandLandmarks.forEach((pt, i) => {
+          landmarks[32 + i] = [pt.x, pt.y, pt.z];
+        });
+      }
+      return landmarks;
+    }
+
+    function onResults(results) {
+      ctx.save();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+      const landmarks = extract53Landmarks(results);
+      landmarks.forEach(([x, y]) => {
+        if (x !== 0 && y !== 0) {
+          ctx.beginPath();
+          ctx.arc(x * canvas.width, y * canvas.height, 4, 0, 2 * Math.PI);
+          ctx.fillStyle = "#38bdf8";
+          ctx.fill();
+        }
+      });
+      ctx.restore();
+
+      if (ws && ws.readyState === WebSocket.OPEN && !isAwaitingInference) {
+        isAwaitingInference = true;
+        ws.send(JSON.stringify({ landmarks }));
+      }
+      isProcessing = false;
+    }
+
+    const holistic = new Holistic({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`
+    });
+    holistic.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    holistic.onResults(onResults);
+
+    async function processLoop() {
+      if (video.readyState >= 2 && !isProcessing) {
+        isProcessing = true;
+        try {
+          await holistic.send({ image: video });
+        } catch (err) {
+          isProcessing = false;
+        }
+      }
+      animId = requestAnimationFrame(processLoop);
+    }
+
+    async function startCamera() {
+      hideError();
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        animId = requestAnimationFrame(processLoop);
+      } catch (err) {
+        showError("Camera error: " + err.message);
+      }
+    }
+
+    function stopCamera() {
+      if (animId) cancelAnimationFrame(animId);
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      document.getElementById("signLabel").innerText = "WAITING";
+    }
+
+    initWebSocket();
+  </script>
+</body>
+</html>
